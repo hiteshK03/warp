@@ -84,6 +84,28 @@ inline float64 df_normalize(float h, float l)
     return float64(s, e);
 }
 
+// ---- non-finite handling ----
+// Metal's fast-math may fold FP predicates (isfinite/isnan/x==x) under no-NaN/no-inf
+// assumptions, so finiteness is tested on the INTEGER bit pattern, which cannot be
+// folded that way. Error-free transforms are invalid on inf/NaN (inf-inf, inf*0),
+// so every op post-checks its result and falls back to the hi-word-only operation,
+// which has correct IEEE inf/NaN semantics.
+inline uint df_abits(float x) { return as_type<uint>(x) & 0x7fffffffu; }
+inline bool df_fin(float x) { return df_abits(x) < 0x7f800000u; }
+inline bool df_isinf(float x) { return df_abits(x) == 0x7f800000u; }
+
+// r: the full df64 result. naive: the same op applied to the hi words only.
+// If both words are finite the df64 result stands. Otherwise the pair is not a
+// valid representation: keep an infinite hi (finite inputs that overflowed in the
+// tail normalize), else defer to the hi-word result (which yields the right
+// inf/NaN/zero for inf and zero inputs).
+inline float64 df_guard(const float64 WP_THREAD& r, float naive)
+{
+    if (df_fin(r.hi) && df_fin(r.lo))
+        return r;
+    return float64(df_isinf(r.hi) ? r.hi : naive, 0.0f);
+}
+
 // ---- arithmetic ----
 
 inline float64 operator+(const float64 WP_THREAD& a, const float64 WP_THREAD& b)
@@ -91,7 +113,7 @@ inline float64 operator+(const float64 WP_THREAD& a, const float64 WP_THREAD& b)
     float s, e;
     df_two_sum(a.hi, b.hi, s, e);
     e += a.lo + b.lo;
-    return df_normalize(s, e);
+    return df_guard(df_normalize(s, e), a.hi + b.hi);
 }
 
 inline float64 operator-(const float64 WP_THREAD& a, const float64 WP_THREAD& b)
@@ -99,7 +121,7 @@ inline float64 operator-(const float64 WP_THREAD& a, const float64 WP_THREAD& b)
     float s, e;
     df_two_sum(a.hi, -b.hi, s, e);
     e += a.lo - b.lo;
-    return df_normalize(s, e);
+    return df_guard(df_normalize(s, e), a.hi - b.hi);
 }
 
 inline float64 operator-(const float64 WP_THREAD& a)
@@ -112,7 +134,7 @@ inline float64 operator*(const float64 WP_THREAD& a, const float64 WP_THREAD& b)
     float p, e;
     df_two_prod(a.hi, b.hi, p, e);
     e += a.hi * b.lo + a.lo * b.hi;
-    return df_normalize(p, e);
+    return df_guard(df_normalize(p, e), a.hi * b.hi);
 }
 
 inline float64 operator/(const float64 WP_THREAD& a, const float64 WP_THREAD& b)
@@ -122,7 +144,7 @@ inline float64 operator/(const float64 WP_THREAD& a, const float64 WP_THREAD& b)
     // r = a - q1*b (computed in df64 to keep the residual accurate)
     float64 r = a - float64(q1) * b;
     float q2 = r.hi / b.hi;
-    return df_normalize(q1, q2);
+    return df_guard(df_normalize(q1, q2), a.hi / b.hi);
 }
 
 inline float64 WP_THREAD& operator+=(float64 WP_THREAD& a, const float64 WP_THREAD& b) { a = a + b; return a; }
@@ -154,11 +176,13 @@ inline float64 sqrt(const float64 WP_THREAD& a)
     if (a.hi == 0.0f)
         return float64(0.0f);
     float s = metal::sqrt(a.hi);
+    if (!df_fin(s))
+        return float64(s, 0.0f);  // inf or NaN: no residual refinement is valid
     // residual: (a - s*s) / (2*s), with s*s computed exactly via FMA
     float p, e;
     df_two_prod(s, s, p, e);
     float64 r = a - float64(p, e);
-    return df_normalize(s, (r.hi / (2.0f * s)));
+    return df_guard(df_normalize(s, (r.hi / (2.0f * s))), s);
 }
 
 
