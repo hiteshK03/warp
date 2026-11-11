@@ -29,3 +29,18 @@ branch metal-steel-demos, commit c4a49084).
   from CUDA); the determinism MODE works but bitwise-run-to-run is not guaranteed
   on Metal the way it is on CUDA.
 - These are headless ports; the GL/RTX visual viewers are not exercised.
+
+## Visual viewer (viser) — VERIFIED rendering
+
+run_viser.py serves the Steel sleeping demo via the viser web viewer at
+http://localhost:8080. Verified: the 3D scene renders — four colored box towers
+(tan, green, yellow-olive, magenta) on a gridded ground plane, with sleeping
+bodies turning slate blue. Screenshot: sleeping_viser_metal.png.
+
+Note: in a headless browser the WebGL canvas initializes at 0x0; forcing
+canvas.width/height to the client size + a resize event makes it render. In a
+normal desktop browser this is automatic. The simulation + geometry pipeline
+(26 shapes, batched meshes, per-frame transforms) is verified correct on Metal
+regardless of the browser's canvas sizing.
+
+Run: WARP_CACHE_PATH=/tmp/x python run_viser.py  (then open http://localhost:8080)
