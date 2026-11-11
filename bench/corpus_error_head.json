@@ -1,0 +1,82 @@
+{
+  "label": "error_head",
+  "mode": "error",
+  "results": {
+    "f32_only": {
+      "launched": true,
+      "value": 6.0
+    },
+    "f64_scalar_internal": {
+      "launched": false,
+      "error": "RuntimeError: Kernel 'k_f64scalar' uses builtins that are not supported on Metal yet: float64"
+    },
+    "vec3d": {
+      "launched": false,
+      "error": "RuntimeError: Kernel 'k_vec3d' uses builtins that are not supported on Metal yet: float64"
+    },
+    "mat33d_inverse": {
+      "launched": false,
+      "error": "RuntimeError: Kernel 'k_mat33d' uses builtins that are not supported on Metal yet: float64"
+    },
+    "quatd": {
+      "launched": false,
+      "error": "RuntimeError: Kernel 'k_quatd' uses builtins that are not supported on Metal yet: float64"
+    },
+    "struct_f64_field": {
+      "launched": false,
+      "error": "RuntimeError: Kernel 'k_struct64' uses builtins that are not supported on Metal yet: float64"
+    },
+    "generic_func_f64": {
+      "launched": false,
+      "error": "RuntimeError: Error while parsing function \"k_generic\" at /Users/viani/dev/warp-metal-fork/bench/p1_msl_corpus.py:149:\n    o[0] = wp.float32(double_it(wp.float64(3.0)))\n;Error while parsing function \"double_it\" at /Users/viani/dev/warp-metal-fork/bench/p1_msl_corpus.py:2:\n    return v * 2.0\n;Input types must be t"
+    },
+    "sin_f64": {
+      "launched": false,
+      "error": "RuntimeError: Kernel 'k_sin64' uses builtins that are not supported on Metal yet: float64"
+    },
+    "int64_to_f64": {
+      "launched": false,
+      "error": "RuntimeError: Kernel 'k_int64cast' uses builtins that are not supported on Metal yet: float64"
+    },
+    "f64_array_abi": {
+      "launched": false,
+      "error": "RuntimeError: Kernel 'k_arr64' uses builtins that are not supported on Metal yet: float64"
+    },
+    "f64_atomic": {
+      "launched": false,
+      "error": "RuntimeError: Kernel 'k_atomic64' uses builtins that are not supported on Metal yet: float64"
+    },
+    "f64_scalar_arg": {
+      "launched": false,
+      "error": "RuntimeError: Kernel 'k_scalararg' uses builtins that are not supported on Metal yet: float64"
+    },
+    "mixed_clean_kernel_launches": {
+      "launched": true,
+      "value": 2.0
+    },
+    "mixed_fp64_kernel": {
+      "launched": false,
+      "error": "RuntimeError: Kernel 'k_mixed_fp64' uses builtins that are not supported on Metal yet: float64"
+    },
+    "mixed_sin_clean_launches": {
+      "launched": true,
+      "value": 6.0
+    }
+  },
+  "hashes": {
+    "c_f32": "1b5d4ed885802e70",
+    "c_f64scalar": "13a7e4dc8b00b9fd",
+    "c_vec3d": "243044b77fb9b073",
+    "c_mat33d": "f02adbda4e6d0ac5",
+    "c_quatd": "3c8b63d1c1fe32d3",
+    "c_struct64": "4ce0252223b6e313",
+    "c_genericfunc": "07c20db4bb2a2dce",
+    "c_sin64": "016a5c0af39ccfeb",
+    "c_int64cast": "12f9bc4e107e3b7f",
+    "c_arr64": "d2fa6f6c3ecf7598",
+    "c_atomic64": "2f4a3cabae7bb637",
+    "c_scalararg": "a48411beab27ab14",
+    "c_mixed": "6584cdbffae7af3a",
+    "c_mixed_sin": "4537c8d560f371b0"
+  }
+}

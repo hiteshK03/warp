@@ -3647,6 +3647,13 @@ class ModuleBuilder:
         if device == "metal":
             # Metal compiles from an in-memory string without include paths
             source = warp._src.build.expand_includes(source)
+            if self.options.get("metal_float64", "error") == "df64":
+                # Append the df64 emulation AFTER the base headers are inlined, and
+                # only for opted-in modules, so other modules' source is unchanged.
+                df64_path = os.path.join(warp_home, "native", "metal_float64.h")
+                with open(df64_path, encoding="utf-8") as f:
+                    df64_src = f.read().replace("#pragma once", "")
+                source += "\n" + warp._src.build.expand_includes(df64_src, os.path.dirname(df64_path))
             source = warp._src.build.metal_rewrite_printf(source)  # shader logging has no %s
 
         return source
