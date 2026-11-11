@@ -178,3 +178,54 @@ Overlay Python must match the shipped `libwarp.dylib`. The fork's `main`
 context.py is newer than the 1.17 binary (references
 `wp_llvm_set_cpu_block_runtime`), so P1 work targeting the released overlay lives
 on `metal-df64` (based on metal-1.17), not `main`.
+
+
+---
+
+# CORRECTION — df64 does NOT fix range-driven underflow/overflow
+
+An earlier claim in this document (that df64 "covers the underflow/overflow cases
+Newton cares about") is **wrong** and is retracted here. Measured on metal:0
+(bench/p1_range_map.py): determinant of a scaled identity, then its reciprocal.
+
+| scale | true det | df64 det | true 1/det | df64 1/det | verdict |
+|---|---|---|---|---|---|
+| 1e-3  | 1e-9  | 1e-9  | 1e9  | 1e9  | ok |
+| 1e-7  | 1e-21 | 1e-21 | 1e21 | 1e21 | ok |
+| 1e-12 | 1e-36 | 1e-36 | 1e36 | 1e36 | ok |
+| 1e-15 | 1e-45 | **0.0** | 1e45 | **NaN** | BROKEN |
+| 1e-20 | 1e-60 | **0.0** | 1e60 | **NaN** | BROKEN |
+
+What df64 actually buys is **mantissa precision** (~44-48 bits: resolving small
+eigenmoments, avoiding cancellation). It does **not** widen the exponent range.
+Newton's own comment cites "determinant underflow" and "reciprocal overflow" —
+those are *range* problems and df64 leaves them unchanged. The failure mode is
+**NaN, silently**, not a clean inf and not a raised error.
+
+Practical impact: Newton's real models are far inside the safe zone (quadruped
+inertias ~1e-3 scale; `body_inv_inertia` matched CPU exactly), so the P1
+acceptance result stands. But "float64 now works on Metal" is too broad a claim.
+
+## Comparison-operator check (was a suspicion, now tested)
+
+`operator<` compares hi then lo lexicographically, which is only valid for
+canonical pairs. Tested (bench/p1_selfcheck.py): equal values built via different
+arithmetic paths order consistently with subtraction, and large-magnitude /
+tiny-delta ordering agrees with `(y-x)>0`. Also, Warp exposes **no two-arg
+`float64(hi, lo)` constructor**, so user code cannot inject non-canonical pairs.
+Risk is therefore narrower than feared, but not provably absent for all internal
+intermediates.
+
+## Open design question (do not ship as-is without deciding)
+
+Silently substituting a non-IEEE type for `float64` is a footgun. Options:
+1. **Opt-in** (`wp.config.metal_float64 = "df64"`), default keeps raising. Most
+   honest; costs Newton-on-Metal out-of-the-box.
+2. **Automatic + loud one-time warning** stating precision gained, range NOT
+   gained, and the NaN failure mode.
+3. **Range contract with detection**: keep df64, but detect subnormal/zero `hi`
+   in division and raise/flag instead of returning NaN.
+4. **Extended-exponent df64** (separate scale factor): actually fixes range, but
+   substantially more work and slower.
+
+Leaning 2+3 for a research fork, 1 for anything upstreamed.
