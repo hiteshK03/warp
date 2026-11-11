@@ -229,3 +229,67 @@ Silently substituting a non-IEEE type for `float64` is a footgun. Options:
    substantially more work and slower.
 
 Leaning 2+3 for a research fork, 1 for anything upstreamed.
+
+
+---
+
+# EXTERNAL REVIEW (Claude Opus) + EMPIRICAL VERIFICATION — P1 IS NOT SOUND AS WRITTEN
+
+Full review: P1-CLAUDE-REVIEW.md. Repro: bench/p1_verify_review.py.
+Every claim below was **executed and confirmed** on metal:0, not accepted on faith.
+
+| # | claim | measured | severity |
+|---|---|---|---|
+| C1 | scalar `wp.float64` kernel arg bypasses the gate | launched with `1.0`, kernel reads **1.875** | **CRITICAL — silent garbage** |
+| C3 | literals/int conversion capped at 24 bits | `float64(16777217) - float64(16777216)` = **0.0** | high |
+| C4 | `floor`/`mod` round `hi+lo` first | `floor(1-2^-30)` = **1.0** (want 0); `mod(x,1)` = **-9.3e-10** (negative from positive operands) | high |
+| C5 | inf arithmetic collapses to NaN | `3e38*3e38`, `inf+1`, `inf*1`, `sqrt(inf)` all **NaN** | high |
+
+C1 is the worst: host packs binary64 into 8 bytes and `struct{float hi,lo}` is also
+8 bytes, so nothing fails — the bits are silently reinterpreted. My regex gate only
+inspected *arrays*, never scalar arguments or structs with fp64 fields. The gate
+therefore does not deliver the safety property I claimed for it.
+
+Also raised and NOT yet verified (treat as open):
+- **Fast-math collapse**: Metal may compile with fast math; reassociation can fold
+  `(a-(s-bb))+(b-bb)` to 0 and `fma(a,b,-(a*b))` to 0, silently degrading df64 to
+  float32. My passing canary only proves this compiler/inlining context left it
+  alone. Needs `mathMode = .safe` for df64 modules + a CI canary.
+- **`==` vs `<` disagreement**: `==` rounds `hi+lo`, `<` is lexicographic.
+- **`<=`/`>=` written as negated `<`** makes NaN comparisons true both ways.
+- **Sloppy Dekker add**: error bounded by |a|+|b|, not |a+b| — weakest exactly in
+  the cancellation case df64 exists for. Needs the accurate two-two_sum add.
+- **Gate misses** `array_t<vec_t<3,float64>>`, mat/quat/transform arrays, fabric/
+  indexed variants; the atomic regex almost never fires because codegen emits
+  `atomic_add(var_a, var_i, var_v)` with no type in the text.
+- **Validation was not discriminating**: a 1.2e-8 relative error on a float32
+  output is just float32 output rounding (eps/2 ~ 6e-8). "Matches CPU exactly" on
+  float32 outputs would also hold with float32 intermediates in a well-conditioned
+  case. Each test needs a float32-intermediate control that visibly fails. The
+  eig3 {1e-8,1,3} test does discriminate; the inverse-inertia test does not.
+
+## Reviewer's recommendation (and my assessment)
+
+The trade is backwards for the motivating case: `finalize()` is a **one-time setup
+kernel**, so paying 30-100x for *correct* softfloat IEEE binary64 is free in
+practice, while df64 buys speed we don't need in exchange for non-IEEE semantics.
+
+Proposed tiering:
+1. `float64` on Metal = **softfloat binary64** (bit-exact, full range, correct
+   inf/NaN, layout-compatible so fp64 arrays/args work and most of the gate
+   disappears; atomics stay blocked).
+2. df64 becomes an explicit opt-in for hot paths (e.g. Steel per-step), only after
+   discriminating validation with float32 controls.
+3. **Power-of-two pre-scaling** inside `inverse`/`eig3` removes the range hazard
+   for those ops at negligible cost — and is worth upstreaming to Newton
+   independently, since it helps float32 too.
+4. Alternatively/additionally: run the fp64 setup kernels on the **CPU device**
+   (real binary64, unified memory makes the transfer nearly free). Doesn't help
+   Steel's per-step fp64.
+
+## Status
+
+P1 stays on `metal-df64` (NOT proposed upstream). The Newton acceptance result
+(finalize + Steel stepping, inverses matching CPU) is real but **narrow**: it holds
+for well-conditioned, in-range models and does not establish that float64 is
+correctly supported. Do not describe P1 as "float64 works on Metal".
