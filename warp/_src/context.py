@@ -3703,6 +3703,13 @@ class ModuleExec:
         self.metal_unsupported: dict[str, str] = {}
         self.metal_backward_unsupported: set[str] = set()  # kernels whose adjoint cannot run on Metal (tiles)
         self.metal_backward_error: str | None = None  # compile error that forced a forward-only build
+        # Metal fault isolation: when a whole-module MSL compile fails, each kernel is
+        # compiled in isolation. Good kernels get their own metallib handle here
+        # (mangled_name -> handle); bad kernels are recorded in metal_refused
+        # (mangled_name -> compiler error) and raise on launch. None when the module
+        # compiled as a whole (the normal path).
+        self.metal_per_kernel_libs: dict[str, object] | None = None
+        self.metal_refused: dict[str, str] = {}
         # Compute capability the loaded binary was actually compiled for (None for
         # CPU). Cluster classification must use this frozen target, not the current
         # global config, which can change after the module is loaded.
@@ -3718,6 +3725,10 @@ class ModuleExec:
                         runtime.core.wp_cuda_unload_module(self.device.context, self.handle)
                 elif self.device.is_metal:
                     runtime.core.wp_metal_unload_library(self.handle)
+                    # Fault-isolated modules hold one metallib per good kernel.
+                    if self.metal_per_kernel_libs:
+                        for lib in self.metal_per_kernel_libs.values():
+                            runtime.core.wp_metal_unload_library(lib)
                 else:
                     runtime.llvm.wp_unload_obj(self.handle.encode("utf-8"))
             except (TypeError, AttributeError):
@@ -3860,11 +3871,26 @@ class ModuleExec:
             )
 
         elif self.device.is_metal:
+            # Fault isolation: a kernel refused by per-kernel compile raises here,
+            # keyed by mangled name so generic overloads are refused individually.
+            refused = self.metal_refused.get(name)
+            if refused:
+                raise RuntimeError(
+                    f"Kernel '{kernel.key}' cannot compile on Metal ({self.device}):\n{refused}"
+                )
+            # When the module was fault-isolated, each good kernel has its own metallib.
+            lib = self.handle
+            if self.metal_per_kernel_libs is not None:
+                lib = self.metal_per_kernel_libs.get(name)
+                if lib is None:
+                    raise RuntimeError(
+                        f"Kernel '{kernel.key}' has no compiled Metal library after fault isolation"
+                    )
             unsupported = self.metal_unsupported.get(name)
             forward = (
                 None
                 if unsupported
-                else runtime.core.wp_metal_get_kernel(self.handle, (name + "_metal_forward").encode("utf-8"))
+                else runtime.core.wp_metal_get_kernel(lib, (name + "_metal_forward").encode("utf-8"))
             )
             if not forward and not unsupported:
                 raise RuntimeError(
@@ -3873,7 +3899,7 @@ class ModuleExec:
             backward = None
             backward_name = warp._src.codegen.cuda_kernel_backward_name(kernel)
             if options["enable_backward"] and not unsupported and name not in self.metal_backward_unsupported:
-                backward = runtime.core.wp_metal_get_kernel(self.handle, (name + "_metal_backward").encode("utf-8"))
+                backward = runtime.core.wp_metal_get_kernel(lib, (name + "_metal_backward").encode("utf-8"))
             hooks = KernelHooks(
                 forward,
                 backward,
@@ -4563,6 +4589,44 @@ class Module:
         ltoirs, fatbins = builder.get_link_inputs()
         return source, ext, meta, ltoirs, fatbins
 
+    def _metal_isolate_kernels(self, device, options: dict) -> tuple[dict, dict, dict]:
+        """Fault isolation for a failed whole-module Metal compile.
+
+        Compile each live kernel in its own translation unit. Returns
+        ``(libs, refused, metas)`` where libs maps mangled_name -> metallib handle
+        for kernels that compile, refused maps mangled_name -> compiler error for
+        those that do not, and metas merges their per-kernel metadata.
+
+        Only MSL-compiler faults are isolated here; a WarpCodegenError raised while
+        building a kernel still propagates (codegen runs before any MSL exists).
+        Refusals are NOT cached: Metal compile failures can be transient (compiler
+        service crashes), so they are recomputed on each load.
+        """
+        libs: dict[str, object] = {}
+        refused: dict[str, str] = {}
+        metas: dict = {}
+        # Pass the exact resolved options from the failed build; do not re-read
+        # module/global config (the global-config leak was deliberately closed).
+        live = list(self._get_live_kernels())
+        for kernel in live:
+            name = kernel.get_mangled_name()
+            try:
+                hasher = ModuleHasher([kernel], options)
+                builder = ModuleBuilder(self, options, hasher=hasher, device="metal")
+                src = builder.codegen("metal")
+                meta = builder.build_meta()
+            except Exception as e:
+                # Codegen-level failure for this kernel: refuse it, keep going.
+                refused[name] = f"{type(e).__name__}: {e}"[:2000]
+                continue
+            handle = runtime.core.wp_metal_load_library(device.metal_ordinal, src.encode("utf-8"))
+            if handle:
+                libs[name] = handle
+                metas.update(meta)
+            else:
+                refused[name] = runtime.get_error_string()[:2000]
+        return libs, refused, metas
+
     def _compile(
         self,
         device: Device | None = None,
@@ -4999,11 +5063,40 @@ class Module:
                         source = source_file.read()
                     handle = runtime.core.wp_metal_load_library(device.metal_ordinal, source.encode("utf-8"))
                 if not handle:
-                    module_load_timer.extra_msg = " (error)"
-                    raise Exception(
-                        f"Failed to compile Metal module '{self.name}' ({module_load_diagnostics}):\n"
-                        f"{runtime.get_error_string()}"
+                    # Whole-module MSL compile failed. Isolate per kernel so one bad
+                    # kernel (e.g. sin(float64) with no df64 overload) does not take
+                    # down its siblings. Keep a metallib per good kernel; refuse the
+                    # bad ones by mangled name. Refusals are not cached (transient
+                    # compiler failures must not persist).
+                    libs, refused, iso_meta = self._metal_isolate_kernels(device, options)
+                    if not libs:
+                        module_load_timer.extra_msg = " (error)"
+                        raise Exception(
+                            f"Failed to compile Metal module '{self.name}' ({module_load_diagnostics}):\n"
+                            f"{runtime.get_error_string()}"
+                        )
+                    meta = {**meta, **iso_meta}
+                    module_exec = ModuleExec(
+                        None,
+                        module_hash,
+                        device,
+                        meta,
+                        active_block_dim,
+                        output_arch,
+                        det_launch_meta_map,
                     )
+                    module_exec.metal_per_kernel_libs = libs
+                    module_exec.metal_refused = refused
+                    module_exec.metal_unsupported = dict(
+                        re.findall(r"^// wp_metal_unsupported (\S+): (.*)$", source, re.M)
+                    )
+                    if refused:
+                        warp._src.logger.log_warning(
+                            f"Metal module '{self.name}': {len(refused)} kernel(s) refused after fault isolation "
+                            f"({len(libs)} compiled): " + ", ".join(sorted(refused))
+                        )
+                    self.execs[(device.context, active_block_dim)] = module_exec
+                    return module_exec
                 # markers written by codegen_kernel for kernels that reach unsupported builtins
                 metal_unsupported = dict(re.findall(r"^// wp_metal_unsupported (\S+): (.*)$", source, re.M))
                 metal_backward_unsupported = set(re.findall(r"^// wp_metal_backward_unsupported (\S+)$", source, re.M))
