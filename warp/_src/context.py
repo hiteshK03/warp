@@ -2909,6 +2909,11 @@ class ModuleHasher:
 
         # configuration parameters
         for opt in sorted(options.keys()):
+            # See hash_kernel: metal_float64 at its default contributes nothing, so
+            # default modules hash as pre-P1 (the header digest still reflects the
+            # genuinely-changed native headers, which is intended).
+            if opt == "metal_float64" and options[opt] == "error":
+                continue
             s = f"{opt}:{options[opt]}"
             ch.update(bytes(s, "utf-8"))
 
@@ -2950,6 +2955,15 @@ class ModuleHasher:
         # process but not across runs.
         ch.update(bytes(kernel.key, "utf-8"))
         for opt in sorted(kernel.options):
+            # metal_float64 only affects Metal codegen. Omit it from the hash when at
+            # its default ("error") so default modules hash exactly as pre-P1 on every
+            # backend (no spurious CPU/CUDA cache invalidation). Opted-in ("df64")
+            # modules still hash differently, which is correct: their Metal binary
+            # differs. The effective value is read from kernel.options (already
+            # resolved); there is no global default that can flip it (config leak
+            # closed), so presence-at-default is equivalent to effective-default.
+            if opt == "metal_float64" and kernel.options[opt] == "error":
+                continue
             ch.update(bytes(f"{opt}:{kernel.options[opt]}", "utf-8"))
         ch.update(self.hash_adjoint(kernel.adj))
         ch.update(self._hash_kernel_return_annotation(kernel))
