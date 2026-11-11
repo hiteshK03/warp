@@ -124,9 +124,9 @@ template <typename Type> struct quat_t {
 using quat = quat_t<float>;
 using quath = quat_t<half>;
 using quatf = quat_t<float>;
-#if !defined(WP_NO_FLOAT64)
-using quatd = quat_t<double>;
-#endif  // !WP_NO_FLOAT64
+#if !defined(WP_NO_FLOAT64) || defined(WP_METAL_DF64)
+using quatd = quat_t<float64>;
+#endif  // !WP_NO_FLOAT64 || WP_METAL_DF64
 
 
 template <typename Type>

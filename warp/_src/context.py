@@ -3418,10 +3418,34 @@ class ModuleBuilder:
         return source
 
     def _metal_unsupported_reason(self, source: str) -> str | None:
-        """Why a generated function or kernel cannot be compiled for Metal, or None."""
+        """Why a generated function or kernel cannot be compiled for Metal, or None.
+
+        float64 is emulated on Metal as a double-single (df64) pair, so *internal*
+        fp64 arithmetic is supported (see native/metal_float64.h). Still unsupported:
+
+        - fp64 in the kernel ABI (arrays of float64): the host layout is binary64
+          while df64 is two float32s, so they are not interchangeable.
+        - fp64 atomics: no 64-bit float atomics on Metal, and a df64 pair cannot be
+          updated atomically.
+        - raw ``double``: only reachable from native snippets, never from codegen
+          of Warp types.
+
+        The emulation keeps float32's exponent *range*, so it is not IEEE binary64;
+        see the header for the precision/range contract.
+        """
         code = re.sub(r"//[^\n]*|/\*.*?\*/", "", source, flags=re.S)  # comments echo the Python source
-        if re.search(r"\bfloat64\b|\bdouble\b", code):  # whole tokens: not names that merely contain them
-            return "float64"
+
+        if re.search(r"\bdouble\b", code):
+            return "double (Metal has no double type)"
+
+        # fp64 storage in the kernel ABI cannot be marshalled to/from df64.
+        if re.search(r"\b(indexed)?array_t<\s*(wp::)?float64\s*>", code):
+            return "float64 arrays (df64 is not host-compatible binary64)"
+
+        # df64 pairs cannot be updated atomically.
+        if re.search(r"\batomic_\w+\s*\([^;]*?\bfloat64\b", code):
+            return "float64 atomics (no 64-bit float atomics on Metal)"
+
         for name in self.metal_skipped:
             if re.search(rf"\b{re.escape(name)}\b", code):
                 return f"{name} (float64)"
@@ -3511,7 +3535,7 @@ class ModuleBuilder:
                     struct,
                     include_tile_helpers=struct.hash in tile_helper_structs,
                 )
-                if device == "metal" and ("float64" in struct_source or self._metal_unsupported_reason(struct_source)):
+                if device == "metal" and self._metal_unsupported_reason(struct_source):
                     # no float64 on Metal; structs nesting a dropped struct are dropped with it, and
                     # functions and kernels that use them are dropped by name below
                     self.metal_skipped.add(struct.native_name)

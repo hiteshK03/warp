@@ -29,7 +29,9 @@ template <unsigned Rows, unsigned Cols, typename Type> struct mat_t {
     {
         for (unsigned i = 0; i < Rows; ++i)
             for (unsigned j = 0; j < Cols; ++j)
-                data[i][j] = other.data[i][j];
+                // Explicit cast: scalar types may have explicit-only conversions
+                // (e.g. the Metal df64 float64, which must not narrow implicitly).
+                data[i][j] = Type(other.data[i][j]);
     }
 
     inline CUDA_CALLABLE mat_t(vec_t<2, Type> c0, vec_t<2, Type> c1)
@@ -4807,7 +4809,9 @@ inline CUDA_CALLABLE void adj_mat_t(
 {
     for (unsigned i = 0; i < Rows; ++i) {
         for (unsigned j = 0; j < Cols; ++j) {
-            adj_other.data[i][j] += adj_ret.data[i][j];
+            // Explicit cast: matches the forward constructor and supports scalar
+            // types with explicit-only conversions (e.g. Metal df64 float64).
+            adj_other.data[i][j] += OtherType(adj_ret.data[i][j]);
         }
     }
 }
@@ -5346,11 +5350,11 @@ using mat22f = mat_t<2, 2, float>;
 using mat33f = mat_t<3, 3, float>;
 using mat44f = mat_t<4, 4, float>;
 
-#if !defined(WP_NO_FLOAT64)
-using mat22d = mat_t<2, 2, double>;
-using mat33d = mat_t<3, 3, double>;
-using mat44d = mat_t<4, 4, double>;
-#endif  // !WP_NO_FLOAT64
+#if !defined(WP_NO_FLOAT64) || defined(WP_METAL_DF64)
+using mat22d = mat_t<2, 2, float64>;
+using mat33d = mat_t<3, 3, float64>;
+using mat44d = mat_t<4, 4, float64>;
+#endif  // !WP_NO_FLOAT64 || WP_METAL_DF64
 
 inline CUDA_CALLABLE void
 adj_mat22(vec2 c0, vec2 c1, vec2 WP_THREAD& a0, vec2 WP_THREAD& a1, const mat22 WP_THREAD& adj_ret)

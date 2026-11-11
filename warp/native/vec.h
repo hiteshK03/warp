@@ -145,11 +145,11 @@ using vec2f = vec_t<2, float>;
 using vec3f = vec_t<3, float>;
 using vec4f = vec_t<4, float>;
 
-#if !defined(WP_NO_FLOAT64)
-using vec2d = vec_t<2, double>;
-using vec3d = vec_t<3, double>;
-using vec4d = vec_t<4, double>;
-#endif  // !WP_NO_FLOAT64
+#if !defined(WP_NO_FLOAT64) || defined(WP_METAL_DF64)
+using vec2d = vec_t<2, float64>;
+using vec3d = vec_t<3, float64>;
+using vec4d = vec_t<4, float64>;
+#endif  // !WP_NO_FLOAT64 || WP_METAL_DF64
 
 // Type trait to detect if a type is a vec_t
 template <typename T> struct is_vector {

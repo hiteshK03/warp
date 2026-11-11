@@ -47,6 +47,15 @@ template <> struct _svd_config<double> {
 };
 #endif  // !WP_NO_FLOAT64
 
+#if defined(WP_METAL_DF64)
+// df64 carries ~44-48 mantissa bits; use an epsilon between float32 and binary64.
+template <> struct _svd_config<float64> {
+    static WP_CONSTANT constexpr float SVD_EPSILON = 1.e-12f;
+    static WP_CONSTANT constexpr float QR_GIVENS_EPSILON = 1.e-12f;
+    static WP_CONSTANT constexpr int JACOBI_ITERATIONS = 8;
+};
+#endif  // WP_METAL_DF64
+
 template <typename Type> inline CUDA_CALLABLE Type recipSqrt(Type x)
 {
 #if defined(__CUDA_ARCH__)
