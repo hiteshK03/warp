@@ -4,6 +4,7 @@
 """Behavior specific to the Metal backend, exercised through the public API."""
 
 import gc
+import os
 import unittest
 from typing import Any
 
@@ -378,6 +379,95 @@ class TestMetalFaultIsolation(unittest.TestCase):
             ctx.Module._metal_isolate_kernels = orig
         self.assertEqual(calls["n"], 0)
         self.assertEqual(float(o.numpy()[0]), 2.0)
+
+    def test_isolation_record_persisted_and_reused(self):
+        # After isolation, a record is written; a fresh ModuleExec load (simulating a
+        # new process by clearing execs) uses the record-cache bundle path.
+        from warp._src import context as ctx  # noqa: PLC0415
+
+        m = self._df64_module("iso_record")
+
+        @wp.kernel(module=m)
+        def good(a: wp.array[float], o: wp.array[float]):
+            i = wp.tid()
+            o[i] = a[i] * 5.0
+
+        @wp.kernel(module=m)
+        def bad(o: wp.array[float]):
+            o[0] = wp.float32(wp.sin(wp.float64(0.5)))
+
+        a = wp.array([2.0], dtype=float, device=self.device)
+        o = wp.zeros(1, dtype=float, device=self.device)
+        wp.launch(good, dim=1, inputs=[a, o], device=self.device)
+        self.assertEqual(float(o.numpy()[0]), 10.0)
+        mh = m.get_module_hash(256)
+        self.assertTrue(os.path.exists(ctx._metal_iso_record_path(mh)))
+        rec = ctx._metal_iso_record_read(mh)
+        self.assertIsNotNone(rec)
+        self.assertEqual(len(rec["refused"]), 1)
+
+        # Simulate a new process: drop the in-memory exec, keep the disk record.
+        m.execs.clear()
+        # Force the record path (not re-isolation) and confirm it loads via bundle.
+        used = {"record": False}
+        orig = ctx.Module._metal_load_with_record
+
+        def spy(self_, *a, **k):
+            r = orig(self_, *a, **k)
+            if r is not None:
+                used["record"] = True
+            return r
+
+        ctx.Module._metal_load_with_record = spy
+        try:
+            o2 = wp.zeros(1, dtype=float, device=self.device)
+            wp.launch(good, dim=1, inputs=[a, o2], device=self.device)
+        finally:
+            ctx.Module._metal_load_with_record = orig
+        self.assertTrue(used["record"], "second load should use the record-cache path")
+        self.assertEqual(float(o2.numpy()[0]), 10.0)
+        with self.assertRaises(RuntimeError):
+            wp.launch(bad, dim=1, inputs=[o2], device=self.device)
+
+    def test_reisolate_env_forces_fresh_isolation(self):
+        from warp._src import context as ctx  # noqa: PLC0415
+
+        m = self._df64_module("iso_reisolate")
+
+        @wp.kernel(module=m)
+        def good(a: wp.array[float], o: wp.array[float]):
+            i = wp.tid()
+            o[i] = a[i] - 1.0
+
+        @wp.kernel(module=m)
+        def bad(o: wp.array[float]):
+            o[0] = wp.float32(wp.sin(wp.float64(0.5)))
+
+        a = wp.array([5.0], dtype=float, device=self.device)
+        o = wp.zeros(1, dtype=float, device=self.device)
+        wp.launch(good, dim=1, inputs=[a, o], device=self.device)
+        m.execs.clear()
+        os.environ["WARP_METAL_REISOLATE"] = "1"
+        try:
+            used = {"record": False}
+            orig = ctx.Module._metal_load_with_record
+
+            def spy(self_, *a, **k):
+                r = orig(self_, *a, **k)
+                if r is not None:
+                    used["record"] = True
+                return r
+
+            ctx.Module._metal_load_with_record = spy
+            try:
+                o2 = wp.zeros(1, dtype=float, device=self.device)
+                wp.launch(good, dim=1, inputs=[a, o2], device=self.device)
+            finally:
+                ctx.Module._metal_load_with_record = orig
+            self.assertFalse(used["record"], "WARP_METAL_REISOLATE must bypass the record")
+            self.assertEqual(float(o2.numpy()[0]), 4.0)
+        finally:
+            del os.environ["WARP_METAL_REISOLATE"]
 
 
 if __name__ == "__main__":
