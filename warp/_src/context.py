@@ -2840,49 +2840,58 @@ def _metal_codegen_fingerprint() -> str:
     The module hash covers kernel source/options/headers but NOT codegen.py or the
     backend .py files; a change there must invalidate isolation records (else a
     stale backward_refused verdict persists after the codegen is fixed). Hash the
-    relevant source files once.
+    relevant source files once, including builtins.py (df64 builtin/adjoint rules)
+    and the native MSL prelude/df64 headers.
     """
     h = hashlib.sha256()
     src_dir = os.path.dirname(__file__)
-    for name in ("codegen.py", "context.py", "build.py"):
+    for name in ("codegen.py", "context.py", "build.py", "builtins.py"):
         try:
             with open(os.path.join(src_dir, name), "rb") as f:
                 h.update(f.read())
         except OSError:
             pass
+    # native_headers_digest covers warp/native/*.h (prelude + df64 headers).
+    h.update(native_headers_digest())
     return h.hexdigest()[:16]
 
 
 @functools.cache
 def _metal_compiler_id() -> str:
-    """OS build + GPU architecture, identifying the runtime Metal compiler.
+    """OS build + machine, identifying the runtime Metal compiler.
 
     platform.mac_ver() is the product version (two betas share it); kern.osversion
-    is the per-build string. The GPU architecture name is more precise than the
-    marketing name. The runtime compiler ships with the OS, so this suffices.
+    is the per-build string. The runtime compiler ships with the OS, so this
+    suffices for the OS axis. The GPU device name is added per-record (see
+    _metal_iso_record_path) since different GPUs on one host can differ in MSL
+    support.
     """
     import platform
     import subprocess
 
     osversion = ""
     try:
-        osversion = subprocess.run(
-            ["sysctl", "-n", "kern.osversion"], capture_output=True, text=True, timeout=5
-        ).stdout.strip()
+        r = subprocess.run(["sysctl", "-n", "kern.osversion"], capture_output=True, text=True, timeout=5)
+        osversion = r.stdout.strip()
     except Exception:
-        osversion = platform.mac_ver()[0]
+        osversion = ""
+    if not osversion:
+        osversion = platform.mac_ver()[0] or platform.version()
     return f"{osversion}|{platform.machine()}"
 
 
-def _metal_iso_record_path(module_hash: bytes) -> str:
+def _metal_iso_record_path(module_hash: bytes, device_name: str = "") -> str:
     key = hashlib.sha256(
-        module_hash + _metal_compiler_id().encode() + _metal_codegen_fingerprint().encode()
+        module_hash
+        + _metal_compiler_id().encode()
+        + _metal_codegen_fingerprint().encode()
+        + device_name.encode()
     ).hexdigest()[:16]
     return os.path.join(warp.config.kernel_cache_dir, f"wp_metal_iso_{module_hash.hex()[:16]}_{key}.json")
 
 
-def _metal_iso_record_read(module_hash: bytes) -> dict | None:
-    path = _metal_iso_record_path(module_hash)
+def _metal_iso_record_read(module_hash: bytes, device_name: str = "") -> dict | None:
+    path = _metal_iso_record_path(module_hash, device_name)
     try:
         with open(path) as f:
             rec = json.load(f)
@@ -2892,20 +2901,24 @@ def _metal_iso_record_read(module_hash: bytes) -> dict | None:
         return None
     if rec.get("compiler_id") != _metal_compiler_id() or rec.get("codegen_fp") != _metal_codegen_fingerprint():
         return None
+    if rec.get("device_name", "") != device_name:
+        return None
     return rec
 
 
-def _metal_iso_record_write(module_hash: bytes, refused: dict, backward_refused: set, bundle_failed: bool) -> None:
+def _metal_iso_record_write(module_hash: bytes, refused: dict, backward_refused: set, bundle_failed: bool,
+                            device_name: str = "") -> None:
     rec = {
         "version": _METAL_ISO_RECORD_VERSION,
         "compiler_id": _metal_compiler_id(),
         "codegen_fp": _metal_codegen_fingerprint(),
-        "refused": {k: v[:500] for k, v in refused.items()},  # mangled -> truncated diagnostic
+        "device_name": device_name,
+        "refused": {k: v[:2000] for k, v in refused.items()},  # mangled -> diagnostic (match in-process truncation)
         "backward_refused": sorted(backward_refused),
         "bundle_failed": bundle_failed,
     }
-    path = _metal_iso_record_path(module_hash)
-    tmp = f"{path}.p{os.getpid()}.tmp"
+    path = _metal_iso_record_path(module_hash, device_name)
+    tmp = f"{path}.p{os.getpid()}.t{threading.get_ident()}.tmp"
     try:
         with open(tmp, "w") as f:
             json.dump(rec, f, sort_keys=True)
@@ -2917,9 +2930,9 @@ def _metal_iso_record_write(module_hash: bytes, refused: dict, backward_refused:
             pass
 
 
-def _metal_iso_record_delete(module_hash: bytes) -> None:
+def _metal_iso_record_delete(module_hash: bytes, device_name: str = "") -> None:
     try:
-        os.remove(_metal_iso_record_path(module_hash))
+        os.remove(_metal_iso_record_path(module_hash, device_name))
     except OSError:
         pass
 
@@ -3823,27 +3836,26 @@ class ModuleExec:
     def __del__(self):
         # Fault-isolated Metal modules have handle=None but own per-kernel metallibs;
         # unload those regardless of the whole-module handle guard below.
+        # Collect unique handles by VALUE (int address), not id(): two ctypes objects
+        # can wrap the same address, and id() would double-unload.
+        libs = []
         if self.metal_per_kernel_libs:
-            # Bundle libs may be shared across several per-kernel entries; collect the
-            # unique handles (per-kernel libs + bundle libs) and unload each once.
+            libs.extend(self.metal_per_kernel_libs.values())
+        if self.metal_bundle_libs:
+            libs.extend(self.metal_bundle_libs)
+        if libs:
             unique = {}
-            for lib in self.metal_per_kernel_libs.values():
-                unique[id(lib)] = lib
-            for lib in self.metal_bundle_libs:
-                unique[id(lib)] = lib
+            for lib in libs:
+                try:
+                    unique[int(lib)] = lib
+                except (TypeError, ValueError):
+                    unique[id(lib)] = lib
             for lib in unique.values():
                 try:
                     runtime.core.wp_metal_unload_library(lib)
                 except (TypeError, AttributeError):
                     pass
             self.metal_per_kernel_libs = None
-            self.metal_bundle_libs = []
-        elif self.metal_bundle_libs:
-            for lib in self.metal_bundle_libs:
-                try:
-                    runtime.core.wp_metal_unload_library(lib)
-                except (TypeError, AttributeError):
-                    pass
             self.metal_bundle_libs = []
         if self.handle is not None:
             try:
@@ -4785,23 +4797,20 @@ class Module:
         return libs, refused, metas, backward_refused
 
     def _metal_build_bundle(self, device, options: dict, good_roots: list, backward_refused: set):
-        """Compile one library containing all good kernels (one prelude + N bodies).
+        """Compile good kernels into one or two libraries (one prelude + N bodies).
 
         Kernels in backward_refused are emitted forward-only via a codegen-time
         override (never mutating Kernel.options, which would change the mangled
-        name). Returns (handle, meta) or (None, {}) if the bundle fails to compile
-        (e.g. an interaction error between kernels that compile alone).
+        name). Returns (name_to_handle, meta) where name_to_handle maps each good
+        kernel's mangled name to the library that contains it, or (None, {}) if any
+        bundle fails to compile (e.g. an interaction error between kernels that
+        compile alone). On failure all loaded handles are unloaded.
         """
-        # Split roots into full (forward+backward) and forward-only groups. The
-        # forward-only group needs enable_backward=False at codegen time. Because a
-        # single ModuleBuilder uses one options dict, build two bundles only if there
-        # is a mix; otherwise one. To keep it simple and correct, build the full
-        # bundle with backward enabled, and if any kernel is backward_refused, build
-        # a separate forward-only bundle for those.
         full_roots = [k for k in good_roots if k.get_mangled_name() not in backward_refused]
         fo_roots = [k for k in good_roots if k.get_mangled_name() in backward_refused]
-        handles = []
+        name_to_handle = {}
         meta = {}
+        loaded = []
         try:
             if full_roots:
                 hasher = ModuleHasher(full_roots, options)
@@ -4811,7 +4820,9 @@ class Module:
                 h = runtime.core.wp_metal_load_library(device.metal_ordinal, src.encode("utf-8"))
                 if not h:
                     raise RuntimeError("bundle compile failed")
-                handles.append(h)
+                loaded.append(h)
+                for k in full_roots:
+                    name_to_handle[k.get_mangled_name()] = h
             if fo_roots:
                 fo_options = options | {"enable_backward": False, "metal_forward_only": True}
                 hasher = ModuleHasher(fo_roots, fo_options)
@@ -4821,96 +4832,83 @@ class Module:
                 h = runtime.core.wp_metal_load_library(device.metal_ordinal, src.encode("utf-8"))
                 if not h:
                     raise RuntimeError("forward-only bundle compile failed")
-                handles.append(h)
+                loaded.append(h)
+                for k in fo_roots:
+                    name_to_handle[k.get_mangled_name()] = h
         except Exception:
-            for h in handles:
+            for h in loaded:
                 try:
                     runtime.core.wp_metal_unload_library(h)
                 except (TypeError, AttributeError):
                     pass
             return None, {}
-        # Return a list of handles; the caller maps kernels to the right one.
-        return handles, meta
+        return name_to_handle, meta
 
     def _metal_load_with_record(self, device, options: dict, module_hash: bytes, active_block_dim: int,
                                 det_launch_meta_map: dict, module_load_timer, module_load_diagnostics: str):
         """Record-driven Metal load: skip the failed whole-module compile when an
-        isolation record exists; compile a bundle of good kernels + retry refused
-        ones individually. Returns a ModuleExec, or None to fall through to the
-        normal whole-module path (no record / re-isolation requested).
+        isolation record exists; compile a bundle of good kernels. Refused kernels
+        are NOT retried when the fingerprint matches (the record is trusted); they
+        are retried only under WARP_METAL_REISOLATE (which bypasses this path
+        entirely). Returns a ModuleExec, or None to fall through to the normal
+        whole-module path (no record / re-isolation requested).
         """
         if os.environ.get("WARP_METAL_REISOLATE"):
             return None
-        rec = _metal_iso_record_read(module_hash)
+        device_name = getattr(device, "name", "")
+        rec = _metal_iso_record_read(module_hash, device_name)
         if rec is None:
             return None
-        refused_names = set(rec.get("refused", {}))
+        refused = dict(rec.get("refused", {}))  # mangled -> diagnostic (trusted)
         backward_refused = set(rec.get("backward_refused", []))
         bundle_failed = rec.get("bundle_failed", False)
 
         all_roots = list(ModuleHasher(list(self._get_live_kernels()), options).get_unique_kernels())
-        # A refused kernel may now compile (e.g. codegen fixed but fingerprint caught
-        # it, or user edited it). Retry refused kernels individually first.
+        good_roots = [k for k in all_roots if k.get_mangled_name() not in refused]
+
         libs: dict[str, object] = {}
-        refused: dict[str, str] = {}
         metas: dict = {}
-        new_backward_refused: set = set()
-        good_roots = []
-        for kernel in all_roots:
-            name = kernel.get_mangled_name()
-            if name in refused_names:
-                # retry this previously-refused kernel in isolation
+        bundle_libs = []  # unique library handles owned by this exec
+
+        if good_roots and not bundle_failed:
+            name_to_handle, bundle_meta = self._metal_build_bundle(device, options, good_roots, backward_refused)
+            if name_to_handle is None:
+                # Interaction failure: fall back to per-kernel for the good set.
+                bundle_failed = True
+            else:
+                libs.update(name_to_handle)
+                metas.update(bundle_meta)
+                bundle_libs = list(dict.fromkeys(name_to_handle.values()))
+
+        if bundle_failed:
+            # Per-kernel libs for the good set (bundle can't be used). Compile each.
+            for kernel in good_roots:
                 sub_libs, sub_refused, sub_meta, sub_bwd = self._metal_isolate_kernels_single(device, options, kernel)
                 libs.update(sub_libs)
-                refused.update(sub_refused)
                 metas.update(sub_meta)
-                new_backward_refused |= sub_bwd
-                if name not in sub_refused:
-                    good_roots.append(kernel)  # healed: rejoin the bundle next time
-            else:
-                good_roots.append(kernel)
+                # a good kernel that now fails individually is genuinely refused
+                refused.update(sub_refused)
+                backward_refused |= sub_bwd
+                bundle_libs.extend(sub_libs.values())
 
-        bundle_handles = []
-        if good_roots and not bundle_failed:
-            bundle_handles, bundle_meta = self._metal_build_bundle(device, options, good_roots, backward_refused | new_backward_refused)
-            if bundle_handles is None:
-                # interaction failure: fall back to per-kernel for the good set
-                bundle_failed = True
-                for kernel in good_roots:
-                    sub_libs, sub_refused, sub_meta, sub_bwd = self._metal_isolate_kernels_single(device, options, kernel)
-                    libs.update(sub_libs)
-                    refused.update(sub_refused)
-                    metas.update(sub_meta)
-                    new_backward_refused |= sub_bwd
-            else:
-                metas.update(bundle_meta)
-                # map each good kernel to its bundle handle (full vs forward-only)
-                for kernel in good_roots:
-                    name = kernel.get_mangled_name()
-                    # full bundle is handles[0] if full_roots existed; fo bundle last
-                    full_roots = [k for k in good_roots if k.get_mangled_name() not in (backward_refused | new_backward_refused)]
-                    fo_roots = [k for k in good_roots if k.get_mangled_name() in (backward_refused | new_backward_refused)]
-                    if name in [k.get_mangled_name() for k in fo_roots]:
-                        libs[name] = bundle_handles[-1]
-                    else:
-                        libs[name] = bundle_handles[0]
-                new_backward_refused |= backward_refused
-
-        if not libs and not bundle_handles:
-            # nothing compiled: fall through to normal path to raise the real error
+        if not libs:
+            # nothing compiled: fall through to the normal path to raise the real error
             return None
 
-        # Persist the updated record. Delete only when fully clean (B1).
-        if not refused and not new_backward_refused and not bundle_failed:
-            _metal_iso_record_delete(module_hash)
+        # Persist the record. Delete only when fully clean (B1): no refusals, no
+        # backward refusals, no bundle failure. backward_refused is NOT re-grown from
+        # stale entries here — it is carried as-is (healing requires a fingerprint
+        # change or WARP_METAL_REISOLATE).
+        if not refused and not backward_refused and not bundle_failed:
+            _metal_iso_record_delete(module_hash, device_name)
         else:
-            _metal_iso_record_write(module_hash, refused, new_backward_refused, bundle_failed)
+            _metal_iso_record_write(module_hash, refused, backward_refused, bundle_failed, device_name)
 
         module_exec = ModuleExec(None, module_hash, device, metas, active_block_dim, None, det_launch_meta_map)
         module_exec.metal_per_kernel_libs = libs
-        module_exec.metal_bundle_libs = bundle_handles  # owned for lifetime
+        module_exec.metal_bundle_libs = list(dict.fromkeys(bundle_libs))
         module_exec.metal_refused = refused
-        module_exec.metal_backward_unsupported = new_backward_refused
+        module_exec.metal_backward_unsupported = backward_refused
         if refused:
             warp._src.logger.log_warning(
                 f"Metal module '{self.name}': {len(refused)} kernel(s) refused (record cache): "
@@ -5448,16 +5446,16 @@ class Module:
                     good_roots = [k for k in all_roots if k.get_mangled_name() not in refused]
                     bundle_failed = False
                     if good_roots:
-                        bh, _ = self._metal_build_bundle(device, options, good_roots, iso_backward_refused)
-                        if bh is None:
+                        name_to_handle, _ = self._metal_build_bundle(device, options, good_roots, iso_backward_refused)
+                        if name_to_handle is None:
                             bundle_failed = True
                         else:
-                            for h in bh:
+                            for h in dict.fromkeys(name_to_handle.values()):
                                 try:
                                     runtime.core.wp_metal_unload_library(h)
                                 except (TypeError, AttributeError):
                                     pass
-                    _metal_iso_record_write(module_hash, refused, iso_backward_refused, bundle_failed)
+                    _metal_iso_record_write(module_hash, refused, iso_backward_refused, bundle_failed, getattr(device, "name", ""))
                     self.execs[(device.context, active_block_dim)] = module_exec
                     return module_exec
                 # markers written by codegen_kernel for kernels that reach unsupported builtins

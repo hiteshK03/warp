@@ -401,8 +401,9 @@ class TestMetalFaultIsolation(unittest.TestCase):
         wp.launch(good, dim=1, inputs=[a, o], device=self.device)
         self.assertEqual(float(o.numpy()[0]), 10.0)
         mh = m.get_module_hash(256)
-        self.assertTrue(os.path.exists(ctx._metal_iso_record_path(mh)))
-        rec = ctx._metal_iso_record_read(mh)
+        dev_name = wp.get_device(self.device).name
+        self.assertTrue(os.path.exists(ctx._metal_iso_record_path(mh, dev_name)))
+        rec = ctx._metal_iso_record_read(mh, dev_name)
         self.assertIsNotNone(rec)
         self.assertEqual(len(rec["refused"]), 1)
 
@@ -468,6 +469,52 @@ class TestMetalFaultIsolation(unittest.TestCase):
             self.assertEqual(float(o2.numpy()[0]), 4.0)
         finally:
             del os.environ["WARP_METAL_REISOLATE"]
+
+    def test_interaction_failure_falls_back_to_per_kernel(self):
+        # Two kernels that each compile alone but fail together (injected). The
+        # record-cache path must fall back to per-kernel libs and still launch both,
+        # without leaking or raising in __del__ (review bugs #1/#2).
+        from warp._src import context as ctx  # noqa: PLC0415
+
+        m = self._df64_module("iso_interaction")
+
+        @wp.kernel(module=m)
+        def k1(a: wp.array[float], o: wp.array[float]):
+            i = wp.tid()
+            o[i] = a[i] + 1.0
+
+        @wp.kernel(module=m)
+        def k2(a: wp.array[float], o: wp.array[float]):
+            i = wp.tid()
+            o[i] = a[i] + 2.0
+
+        @wp.kernel(module=m)
+        def bad(o: wp.array[float]):
+            o[0] = wp.float32(wp.sin(wp.float64(0.5)))
+
+        a = wp.array([1.0], dtype=float, device=self.device)
+        o = wp.zeros(1, dtype=float, device=self.device)
+        # First load: real isolation (bad refused), record written.
+        wp.launch(k1, dim=1, inputs=[a, o], device=self.device)
+        mh = m.get_module_hash(256)
+        dev_name = wp.get_device(self.device).name
+        # Force bundle_failed in the record to exercise the per-kernel fallback path.
+        rec = ctx._metal_iso_record_read(mh, dev_name)
+        self.assertIsNotNone(rec)
+        ctx._metal_iso_record_write(mh, rec["refused"], set(rec["backward_refused"]), True, dev_name)
+        m.execs.clear()
+        # Warm load with bundle_failed=True must still launch both good kernels.
+        o1 = wp.zeros(1, dtype=float, device=self.device)
+        o2 = wp.zeros(1, dtype=float, device=self.device)
+        wp.launch(k1, dim=1, inputs=[a, o1], device=self.device)
+        wp.launch(k2, dim=1, inputs=[a, o2], device=self.device)
+        self.assertEqual(float(o1.numpy()[0]), 2.0)
+        self.assertEqual(float(o2.numpy()[0]), 3.0)
+        # __del__ must not raise (bug #1: bundle_libs=None) — force collection.
+        ex = m.execs.get((wp.get_device(self.device).context, 256))
+        self.assertIsNotNone(ex)
+        del ex
+        gc.collect()  # would surface "Exception ignored in __del__" if buggy
 
 
 if __name__ == "__main__":

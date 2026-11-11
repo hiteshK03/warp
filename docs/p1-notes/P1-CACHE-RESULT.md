@@ -60,3 +60,35 @@ Full test_metal: 17 pass / 1 skip. fixedarray 5/5.
 - No dedicated injected interaction-failure test (bundle fails, kernels pass alone).
 - backward_refused not retried per-load (relies on compiler_id/codegen_fp
   invalidation); a same-OS compiler fix would need a fingerprint change to heal.
+
+## Implementation-review fixes (round 2) — all verified
+
+Blocking bugs fixed:
+- #1 bundle_libs=None on interaction failure -> __del__ TypeError + leak. Fixed:
+  _metal_build_bundle returns a name->handle dict; bundle_libs always a list.
+- #2 bundle_failed=True never loaded good kernels. Fixed: per-kernel fallback runs
+  unconditionally when bundle_failed.
+- #3 backward_refused only grew + fingerprint missed builtins.py/native headers.
+  Fixed: fingerprint now hashes builtins.py + native_headers_digest(); record path
+  no longer re-grows stale backward_refused; healing via fingerprint/REISOLATE.
+- #4 healed refused kernel compiled twice + leaked. Fixed: refused kernels are NOT
+  retried per-load (record trusted when fingerprint matches); retry only via
+  WARP_METAL_REISOLATE. No double-compile.
+- #5 refused retried every load defeated the cache. Fixed (same as #4): warm load
+  now 57ms (was 685ms) — 22x faster than cold.
+- #6 device not in key. Fixed: device.name in record path + record body.
+
+Fragile items fixed:
+- Handle mapping: _metal_build_bundle returns name->handle dict (no O(N^2) re-derive).
+- __del__ dedup by int(lib) value, not id().
+- Temp file name includes thread id.
+- Diagnostic truncation unified to 2000 chars (cold == warm).
+
+Tests added: interaction-failure fallback (bugs #1/#2, __del__ no-raise).
+TestMetalFaultIsolation: 7/7. Full test_metal: 18 pass / 1 skip.
+e2e: cold 1264ms -> warm 57ms (22x).
+
+Remaining gaps: record files never GC'd (every kernel edit leaves a JSON); no
+dedicated mixed full+forward-only bundle test through the record path (the mapping
+is now a dict so the risk is low); bundle_failed sticky on transient XPC failure
+(native API exposes no NSError domain to distinguish).
