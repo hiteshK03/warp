@@ -2560,6 +2560,10 @@ def _normalize_extra_preamble(preamble: str) -> str:
     return preamble
 
 
+# Modules already warned about df64, so the notice fires once per module.
+_metal_df64_warned: set[str] = set()
+
+
 class ModuleBuildOptions:
     """Extra build options for a Warp module.
 
@@ -3435,6 +3439,17 @@ class ModuleBuilder:
         """
         code = re.sub(r"//[^\n]*|/\*.*?\*/", "", source, flags=re.S)  # comments echo the Python source
 
+        # Opt-in gate. Default "error" reproduces the pre-df64 behaviour: any float64
+        # use is refused, the native df64 typedef is not emitted, and the generated
+        # MSL is identical to before. Only "df64" allows internal fp64 arithmetic.
+        if self.options.get("metal_float64", "error") != "df64":
+            if re.search(r"\bfloat64\b|\bdouble\b", code):
+                return "float64"
+            for name in self.metal_skipped:
+                if re.search(rf"\b{re.escape(name)}\b", code):
+                    return f"{name} (float64)"
+            return None
+
         if re.search(r"\bdouble\b", code):
             return "double (Metal has no double type)"
 
@@ -3596,6 +3611,21 @@ class ModuleBuilder:
         # Detect whether this module uses bfloat16; if not, define WP_NO_BFLOAT16
         # to skip compiling bfloat16 overloads in builtin.h (significant LLVM speedup).
         type_defines = "" if "bfloat16" in source else "#define WP_NO_BFLOAT16\n"
+        if device == "metal" and self.options.get("metal_float64", "error") == "df64":
+            # Opt-in only: enables the df64 float64 typedef and ops in the native
+            # headers. Without it the generated MSL is identical to pre-df64.
+            type_defines += "#define WP_METAL_DF64 1\n"
+            if "float64" in source and self.module.name not in _metal_df64_warned:
+                _metal_df64_warned.add(self.module.name)
+                log_warning(
+                    f"module '{self.module.name}' uses Metal float64 emulation (df64): "
+                    "double-single, ~44-48 mantissa bits, NOT IEEE binary64. The exponent "
+                    "range is float32's, so values near/below ~1e-38 underflow and above "
+                    "~3e38 overflow; accuracy is scale-dependent. Known defects: signed "
+                    "zero is lost, mod() is floored-modulo rather than fmod, and values "
+                    "within an ulp of FLT_MAX may overflow spuriously. Prefer host float64 "
+                    "for correctness-critical setup math."
+                )
         if device == "metal" and self.options.get("verify_fp"):
             type_defines += "#define WP_VERIFY_FP\n"  # CPU/CUDA pass this as a compiler flag
 
@@ -3953,6 +3983,11 @@ class Module:
             "enable_mathdx_solver": None,
             "enable_mathdx_fft": None,
             "fast_math": False,
+            # Metal float64 policy: "error" (default) refuses fp64 kernels as before;
+            # "df64" opts this module into double-single emulation. Module-scoped so a
+            # library cannot flip it for its users, and hashed so the kernel cache
+            # cannot serve a df64 binary to an "error" module.
+            "metal_float64": getattr(warp.config, "metal_float64", "error"),
             "fuse_fp": True,
             "lineinfo": warp.config.lineinfo,
             "cuda_output": None,  # supported values: "ptx", "cubin", or None (automatic)

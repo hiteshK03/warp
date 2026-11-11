@@ -135,6 +135,16 @@ Note: Strict and checked modes impact performance.
 version: str = "1.17.0"
 """Warp version string"""
 
+# Metal float64 policy (Apple GPUs have no double type).
+#   "error" (default): kernels using float64 raise at launch, as in the original backend.
+#   "df64": opt in to double-single emulation (~44-48 mantissa bits) for internal fp64.
+# This is only the DEFAULT; set it per module with
+# wp.set_module_options({"metal_float64": "df64"}) so a library cannot enable it for
+# its users. df64 is NOT IEEE binary64: the exponent range stays float32's, and it
+# has known defects (see native/metal_float64.h). Prefer host float64 or a softfloat
+# binary64 path when correctness matters.
+metal_float64: str = "error"
+
 verify_fp: bool = False
 """Enable floating-point verification for inputs and outputs.
 

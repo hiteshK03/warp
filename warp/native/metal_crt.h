@@ -14,11 +14,16 @@
 #include <metal_logging>
 #include <metal_stdlib>
 
-// Metal has no `double`. Keep the raw-double code paths out, but provide wp::float64
-// as a double-single (df64) emulation so float64/vec3d/mat33d/quatd kernels work.
+// Metal has no `double`. Keep the raw-double code paths out.
 #define WP_NO_FLOAT64
-#define WP_METAL_DF64 1
+// wp::float64 as a double-single (df64) emulation is OPT-IN per module: codegen
+// defines WP_METAL_DF64 only when the module sets metal_float64="df64". Without
+// that define this header contributes nothing and the generated MSL matches the
+// pre-df64 backend exactly. See native/metal_float64.h for the precision/range
+// contract and the known defects.
+#if defined(WP_METAL_DF64)
 #include "metal_float64.h"
+#endif
 
 // `half` is a builtin Metal type; Warp's software half lives under another name here.
 #define half wp_half
