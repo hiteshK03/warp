@@ -1,0 +1,25 @@
+{
+  "label": "error_final",
+  "mode": "<absent>",
+  "results": {
+    "internal_fp64": {
+      "launched": false,
+      "error": "RuntimeError: Kernel 'internal_fp64' uses builtins that are not supported on Metal yet: float64"
+    },
+    "mat33d_inverse": {
+      "launched": false,
+      "error": "RuntimeError: Kernel 'mat_inverse' uses builtins that are not supported on Metal yet: float64"
+    },
+    "fp64_array_abi": {
+      "launched": false,
+      "error": "RuntimeError: Kernel 'fp64_array' uses builtins that are not supported on Metal yet: float64"
+    },
+    "fp64_scalar_arg": {
+      "launched": false,
+      "error": "RuntimeError: Kernel 'fp64_scalar' uses builtins that are not supported on Metal yet: float64"
+    },
+    "plain_float32": {
+      "launched": true
+    }
+  }
+}

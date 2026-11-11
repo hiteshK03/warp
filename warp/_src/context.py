@@ -3615,17 +3615,6 @@ class ModuleBuilder:
             # Opt-in only: enables the df64 float64 typedef and ops in the native
             # headers. Without it the generated MSL is identical to pre-df64.
             type_defines += "#define WP_METAL_DF64 1\n"
-            if "float64" in source and self.module.name not in _metal_df64_warned:
-                _metal_df64_warned.add(self.module.name)
-                log_warning(
-                    f"module '{self.module.name}' uses Metal float64 emulation (df64): "
-                    "double-single, ~44-48 mantissa bits, NOT IEEE binary64. The exponent "
-                    "range is float32's, so values near/below ~1e-38 underflow and above "
-                    "~3e38 overflow; accuracy is scale-dependent. Known defects: signed "
-                    "zero is lost, mod() is floored-modulo rather than fmod, and values "
-                    "within an ulp of FLT_MAX may overflow spuriously. Prefer host float64 "
-                    "for correctness-critical setup math."
-                )
         if device == "metal" and self.options.get("verify_fp"):
             type_defines += "#define WP_VERIFY_FP\n"  # CPU/CUDA pass this as a compiler flag
 
@@ -3642,18 +3631,24 @@ class ModuleBuilder:
             extra_preamble = self.options.get("extra_cuda_preamble", "")
             module_header = warp._src.codegen.cuda_module_header.format(block_dim=self.options["block_dim"])
 
-        source = type_defines + module_header + extra_preamble + warp._src.codegen.codegen_cast_macros + source
+        df64_preamble = ""
+        if device == "metal" and self.options.get("metal_float64", "error") == "df64":
+            # The df64 type must exist BEFORE builtin.h instantiates
+            # DECLARE_FLOAT_OPS(float64)/adj_float64, so inject it ahead of the base
+            # headers. Only opted-in modules get this text, so other modules'
+            # generated source is untouched.
+            df64_path = os.path.join(warp_home, "native", "metal_float64.h")
+            with open(df64_path, encoding="utf-8") as f:
+                df64_preamble = f.read().replace("#pragma once", "") + "\n"
+
+        source = (
+            type_defines + df64_preamble + module_header + extra_preamble
+            + warp._src.codegen.codegen_cast_macros + source
+        )
 
         if device == "metal":
             # Metal compiles from an in-memory string without include paths
             source = warp._src.build.expand_includes(source)
-            if self.options.get("metal_float64", "error") == "df64":
-                # Append the df64 emulation AFTER the base headers are inlined, and
-                # only for opted-in modules, so other modules' source is unchanged.
-                df64_path = os.path.join(warp_home, "native", "metal_float64.h")
-                with open(df64_path, encoding="utf-8") as f:
-                    df64_src = f.read().replace("#pragma once", "")
-                source += "\n" + warp._src.build.expand_includes(df64_src, os.path.dirname(df64_path))
             source = warp._src.build.metal_rewrite_printf(source)  # shader logging has no %s
 
         return source
@@ -3991,10 +3986,12 @@ class Module:
             "enable_mathdx_fft": None,
             "fast_math": False,
             # Metal float64 policy: "error" (default) refuses fp64 kernels as before;
-            # "df64" opts this module into double-single emulation. Module-scoped so a
-            # library cannot flip it for its users, and hashed so the kernel cache
-            # cannot serve a df64 binary to an "error" module.
-            "metal_float64": getattr(warp.config, "metal_float64", "error"),
+            # "df64" opts THIS module into double-single emulation. Deliberately NOT
+            # defaulted from warp.config: a global default would let a library opt in
+            # every module created after its import, and would be captured at module
+            # construction time (so setting it later would silently do nothing).
+            # Use wp.set_module_options({"metal_float64": "df64"}) explicitly.
+            "metal_float64": "error",
             "fuse_fp": True,
             "lineinfo": warp.config.lineinfo,
             "cuda_output": None,  # supported values: "ptx", "cubin", or None (automatic)
@@ -4835,6 +4832,25 @@ class Module:
         meta_path: os.PathLike | None = None,
     ) -> ModuleExec | None:
         device = runtime.get_device(device)
+
+        # Warn here, not in codegen: a warm kernel cache skips codegen entirely, so a
+        # codegen-time notice would silently vanish on the second run.
+        if (
+            device.is_metal
+            and self.options.get("metal_float64", "error") == "df64"
+            and self.name not in _metal_df64_warned
+        ):
+            _metal_df64_warned.add(self.name)
+            log_warning(
+                f"module '{self.name}' uses Metal float64 emulation (df64): double-single, "
+                "~44-48 mantissa bits, NOT IEEE binary64. The exponent range is float32's, so "
+                "small values underflow and large ones overflow; accuracy is scale-dependent "
+                "(relative error can reach 1.0 for tiny inputs). Known defects: division near "
+                "FLT_MAX can return a WRONG-SIGN infinity, sqrt(FLT_MAX)^2 overflows spuriously, "
+                "signed zero is lost, copysign(x,-0) is positive, mod() is floored-modulo rather "
+                "than fmod, and isnan/isinf may be folded under fast math. Prefer host float64 "
+                "for correctness-critical math."
+            )
 
         # Resolve the active block_dim without mutating self.options.
         # Module.options["block_dim"] is the documented per-module default
@@ -13379,6 +13395,14 @@ def set_module_options(options: dict[str, Any], module: Any = None):
         module_object = get_module(module_name)
     if "strip_hash" in options:
         module_object._set_strip_hash(options["strip_hash"])
+    if "metal_float64" in options:
+        value = options["metal_float64"]
+        if value not in ("error", "df64"):
+            raise ValueError(
+                f"metal_float64 must be 'error' or 'df64', got {value!r}. "
+                "'df64' opts this module into double-single float64 emulation on Metal "
+                "(not IEEE binary64; see native/metal_float64.h)."
+            )
     module_object.options.update(options)
     module_object.mark_modified()
 
