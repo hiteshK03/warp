@@ -63,3 +63,5 @@ asv/warp-lang
 
 # Core dumps
 core.[0-9]*
+bench/corpus_*.json
+bench/fp64_mode_*.json

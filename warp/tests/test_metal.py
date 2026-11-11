@@ -5,6 +5,7 @@
 
 import gc
 import unittest
+from typing import Any
 
 import numpy as np
 
@@ -269,6 +270,114 @@ class TestMetalInlineBudget(unittest.TestCase):
         finally:
             for name in names:
                 codegen._metal_inlined_lines.pop(name, None)
+
+
+@unittest.skipUnless(metal_available(), "Requires an Apple GPU")
+class TestMetalFaultIsolation(unittest.TestCase):
+    """A kernel that cannot compile on Metal must be refused individually, not take
+    down its sibling kernels in the same module (df64 opt-in, sin(float64) has no
+    overload). See P1 item 7."""
+
+    device = "metal:0"
+
+    def _df64_module(self, name):
+        m = wp.Module(name)
+        wp.set_module_options({"metal_float64": "df64"}, module=m)
+        return m
+
+    def test_bad_kernel_refused_sibling_survives(self):
+        m = self._df64_module("iso_sibling")
+
+        @wp.kernel(module=m)
+        def good(a: wp.array[float], o: wp.array[float]):
+            i = wp.tid()
+            o[i] = a[i] * 3.0
+
+        @wp.kernel(module=m)
+        def bad(o: wp.array[float]):
+            o[0] = wp.float32(wp.sin(wp.float64(0.5)))
+
+        a = wp.array([2.0], dtype=float, device=self.device)
+        o = wp.zeros(1, dtype=float, device=self.device)
+        wp.launch(good, dim=1, inputs=[a, o], device=self.device)
+        self.assertEqual(float(o.numpy()[0]), 6.0)
+        with self.assertRaises(RuntimeError):
+            wp.launch(bad, dim=1, inputs=[o], device=self.device)
+
+    def test_generic_overload_isolated_per_mangled_name(self):
+        # A generic kernel whose float64 overload calls sin(float64): the float32
+        # overload must still run after isolation. This exercises overload expansion
+        # in _metal_isolate_kernels (the generic template itself has no hash).
+        m = self._df64_module("iso_generic")
+
+        @wp.kernel(module=m)
+        def g(a: wp.array(dtype=Any), o: wp.array(dtype=Any)):
+            i = wp.tid()
+            o[i] = wp.sin(a[i])
+
+        wp.overload(g, [wp.array(dtype=wp.float32), wp.array(dtype=wp.float32)])
+        wp.overload(g, [wp.array(dtype=wp.float64), wp.array(dtype=wp.float64)])
+
+        a32 = wp.array([0.5], dtype=wp.float32, device=self.device)
+        o32 = wp.zeros(1, dtype=wp.float32, device=self.device)
+        wp.launch(g, dim=1, inputs=[a32, o32], device=self.device)
+        self.assertAlmostEqual(float(o32.numpy()[0]), float(np.sin(0.5)), places=5)
+
+    def test_good_kernel_keeps_backward_after_isolation(self):
+        m = self._df64_module("iso_backward")
+
+        @wp.kernel(module=m)
+        def sq(x: wp.array[float], o: wp.array[float]):
+            i = wp.tid()
+            o[i] = x[i] * x[i]
+
+        @wp.kernel(module=m)
+        def bad(o: wp.array[float]):
+            o[0] = wp.float32(wp.sin(wp.float64(0.5)))
+
+        x = wp.array([3.0], dtype=float, device=self.device, requires_grad=True)
+        o = wp.zeros(1, dtype=float, device=self.device, requires_grad=True)
+        tape = wp.Tape()
+        with tape:
+            wp.launch(sq, dim=1, inputs=[x, o], device=self.device)
+        tape.backward(loss=o)
+        self.assertAlmostEqual(float(x.grad.numpy()[0]), 6.0, places=4)
+
+    def test_isolation_cached_no_recompile_on_relaunch(self):
+        m = self._df64_module("iso_cache")
+
+        @wp.kernel(module=m)
+        def good(a: wp.array[float], o: wp.array[float]):
+            i = wp.tid()
+            o[i] = a[i] + 1.0
+
+        @wp.kernel(module=m)
+        def bad(o: wp.array[float]):
+            o[0] = wp.float32(wp.sin(wp.float64(0.5)))
+
+        a = wp.array([1.0], dtype=float, device=self.device)
+        o = wp.zeros(1, dtype=float, device=self.device)
+        wp.launch(good, dim=1, inputs=[a, o], device=self.device)
+        exec_after_first = m.execs.get((wp.get_device(self.device).context, 256))
+        self.assertIsNotNone(exec_after_first)
+        self.assertIsNotNone(exec_after_first.metal_per_kernel_libs)
+        # Count isolation calls on the second launch: must be zero (cached exec).
+        from warp._src import context as ctx  # noqa: PLC0415
+
+        calls = {"n": 0}
+        orig = ctx.Module._metal_isolate_kernels
+
+        def counting(self_, *a, **k):
+            calls["n"] += 1
+            return orig(self_, *a, **k)
+
+        ctx.Module._metal_isolate_kernels = counting
+        try:
+            wp.launch(good, dim=1, inputs=[a, o], device=self.device)
+        finally:
+            ctx.Module._metal_isolate_kernels = orig
+        self.assertEqual(calls["n"], 0)
+        self.assertEqual(float(o.numpy()[0]), 2.0)
 
 
 if __name__ == "__main__":
