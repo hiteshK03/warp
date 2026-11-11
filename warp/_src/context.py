@@ -4594,23 +4594,26 @@ class Module:
         ltoirs, fatbins = builder.get_link_inputs()
         return source, ext, meta, ltoirs, fatbins
 
-    def _metal_isolate_kernels(self, device, options: dict) -> tuple[dict, dict, dict]:
+    def _metal_isolate_kernels(self, device, options: dict) -> tuple[dict, dict, dict, set]:
         """Fault isolation for a failed whole-module Metal compile.
 
         Compile each codegen root (generic kernels expanded into their overloads)
-        in its own translation unit. Returns ``(libs, refused, metas)`` where libs
-        maps mangled_name -> metallib handle for kernels that compile, refused maps
-        mangled_name -> compiler error for those that do not, and metas merges their
-        per-kernel metadata.
+        in its own translation unit. Returns ``(libs, refused, metas, backward_refused)``
+        where libs maps mangled_name -> metallib handle for kernels that compile,
+        refused maps mangled_name -> compiler error for those that do not, metas
+        merges their per-kernel metadata, and backward_refused names kernels whose
+        forward compiles but whose adjoint does not (forward kept, backward refused).
 
-        Only MSL-compiler faults are isolated here. Refusals are NOT cached: Metal
-        compile failures can be transient (compiler service crashes), so they are
-        recomputed on each load. On any failure the already-loaded libs are unloaded
-        so they do not leak.
+        Two-tier per kernel: forward+backward first, then forward-only. Only
+        MSL-compiler faults are isolated here. Refusals are NOT cached: Metal compile
+        failures can be transient (compiler service crashes), so they are recomputed
+        on each load. On any failure the already-loaded libs are unloaded so they do
+        not leak.
         """
         libs: dict[str, object] = {}
         refused: dict[str, str] = {}
         metas: dict = {}
+        backward_refused: set[str] = set()
         # Expand generics into overloads: a hasher over all live kernels yields the
         # concrete codegen roots (the generic template itself has no hash).
         roots = list(ModuleHasher(list(self._get_live_kernels()), options).get_unique_kernels())
@@ -4634,9 +4637,23 @@ class Module:
                 if handle:
                     libs[name] = handle
                     metas.update(meta)
-                else:
-                    err = runtime.get_error_string()
-                    refused[name] = err[:2000] if err else "Metal compile failed (no error string)"
+                    continue
+                # Two-tier: a kernel whose forward compiles but whose adjoint does not
+                # should keep its forward and refuse only backward. Retry forward-only.
+                if options.get("enable_backward"):
+                    fo_options = options | {"enable_backward": False, "metal_forward_only": True}
+                    fo_hasher = ModuleHasher([kernel], fo_options)
+                    fo_builder = ModuleBuilder(self, fo_options, hasher=fo_hasher, device="metal")
+                    fo_src = fo_builder.codegen("metal")
+                    fo_meta = fo_builder.build_meta()
+                    fo_handle = runtime.core.wp_metal_load_library(device.metal_ordinal, fo_src.encode("utf-8"))
+                    if fo_handle:
+                        libs[name] = fo_handle
+                        metas.update(fo_meta)
+                        backward_refused.add(name)
+                        continue
+                err = runtime.get_error_string()
+                refused[name] = err[:2000] if err else "Metal compile failed (no error string)"
         except Exception:
             # Any failure partway through: unload what we loaded so nothing leaks,
             # then propagate (the caller raises the whole-module error).
@@ -4646,7 +4663,7 @@ class Module:
                 except (TypeError, AttributeError):
                     pass
             raise
-        return libs, refused, metas
+        return libs, refused, metas, backward_refused
 
     def _compile(
         self,
@@ -5067,7 +5084,12 @@ class Module:
                     source = source_file.read()
                 handle = runtime.core.wp_metal_load_library(device.metal_ordinal, source.encode("utf-8"))
                 backward_error = None
-                if not handle and options["enable_backward"]:
+                # Module-wide forward-only retry only for a single-kernel module: with
+                # multiple kernels it would strip backward from EVERY kernel (including
+                # ones whose adjoint is fine). Multi-kernel modules use per-kernel
+                # two-tier isolation below instead.
+                n_roots = len(list(ModuleHasher(list(self._get_live_kernels()), options).get_unique_kernels()))
+                if not handle and options["enable_backward"] and n_roots <= 1:
                     # an adjoint that does not compile on Metal must not take the forward kernels with it:
                     # rebuild forward-only and refuse backward launches of this module with the reason
                     backward_error = runtime.get_error_string()
@@ -5089,7 +5111,7 @@ class Module:
                     # isolated compile). Isolate per kernel so one bad kernel (e.g.
                     # sin(float64) with no df64 overload) does not take down siblings.
                     whole_module_error = runtime.get_error_string()
-                    libs, refused, iso_meta = self._metal_isolate_kernels(device, options)
+                    libs, refused, iso_meta, iso_backward_refused = self._metal_isolate_kernels(device, options)
                     if not libs:
                         module_load_timer.extra_msg = " (error)"
                         raise Exception(
@@ -5113,7 +5135,7 @@ class Module:
                     )
                     module_exec.metal_backward_unsupported = set(
                         re.findall(r"^// wp_metal_backward_unsupported (\S+)$", source, re.M)
-                    )
+                    ) | iso_backward_refused
                     if refused:
                         warp._src.logger.log_warning(
                             f"Metal module '{self.name}': {len(refused)} kernel(s) refused after fault isolation "

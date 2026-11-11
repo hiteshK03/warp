@@ -31,3 +31,24 @@ all fixed and now covered by unittest (warp/tests/test_metal.py::TestMetalFaultI
 - #9 No per-kernel success caching: every failed load pays N isolated compiles.
 - Injected interaction-failure test (each kernel compiles alone, module fails
   together) not added; the design handles it (per-kernel libs, no subset rebuild).
+
+## Two-tier backward isolation (#4) — implemented
+
+- _metal_isolate_kernels now tries forward+backward per kernel; on failure retries
+  forward-only and marks the kernel backward_refused (forward kept). Returns a
+  4-tuple (libs, refused, metas, backward_refused); the load path unions
+  backward_refused into metal_backward_unsupported.
+- The module-wide forward-only retry is now gated to single-kernel modules
+  (n_roots <= 1). Multi-kernel modules use per-kernel two-tier isolation, so a
+  broken adjoint in one kernel no longer strips backward from its siblings.
+
+Tested: the 4 isolation unittests still pass; full test_metal suite 15 pass / 1 skip.
+
+NOT directly tested: a kernel whose forward compiles but whose adjoint genuinely
+fails. Probed mod/copysign/floor (all have working df64 adjoints: grad 1.0/-1.0/0.0)
+and atan2 (fails in FORWARD, so refused entirely). Warp's generic adjoint generation
+plus the df64 adjoint overloads cover the ops that have forward overloads, so a
+natural forward-OK/backward-FAIL case is hard to construct. The two-tier code path
+is present and the single-kernel forward-only retry (its degenerate case) is
+exercised by the existing suite, but the specific multi-kernel broken-adjoint
+scenario remains unverified by a dedicated test. Honest gap.
