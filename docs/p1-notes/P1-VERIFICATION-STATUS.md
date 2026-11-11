@@ -65,7 +65,10 @@ for 18/90 negative cases). Verified bit-identical to pure 1.17.
 ## Remaining honest gaps (not blocking, documented)
 - Full worktree pre-P1 build (item 1) — overlay restore used instead.
 - Dedicated multi-kernel forward-OK/backward-FAIL test (item 7).
-- Per-kernel success caching (item 7 #9) — every failed load pays N isolated compiles.
+- Per-kernel success caching (item 7 #9) — DONE: isolation-record + good-kernel bundle
+  cache. Warm load ~46% faster (1267ms->685ms e2e); record path verified. See
+  P1-CACHE-RESULT.md. Remaining: sticky bundle_failed on transient XPC failure, no
+  injected interaction-failure test, backward_refused heals only on fingerprint change.
 - Injected interaction-failure test (each kernel compiles alone, module fails together).
 - df64's own numerical defects remain when opted in (wrong-sign inf near FLT_MAX,
   signed zero, floored mod, scale-dependent accuracy) — documented in the warning.
