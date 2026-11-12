@@ -679,6 +679,17 @@ class DeterministicCodegen:
             for target in self.adj.det_meta.scatter_targets:
                 names = kernel_raw_scatter_param_names(target)
                 decls.append(f"auto& {target.helper_name} = {names['buf']};")
+        elif device == "metal":
+            # Metal: real scatter buffers (record-then-host-sort-reduce). The deterministic
+            # thread id is task_index (one GPU thread per task, no grid-stride loop). The
+            # consumed-return counter path is CUDA-only; such kernels are refused on Metal,
+            # so counter_targets is empty here.
+            decls = [
+                "wp::det_ctx det_ctx{_wp_det_phase, _wp_det_debug, task_index, _wp_det_overflow, nullptr, 0};",
+            ]
+            for target in self.adj.det_meta.scatter_targets:
+                names = kernel_raw_scatter_param_names(target)
+                decls.append(f"auto& {target.helper_name} = {names['buf']};")
         else:
             decls = [
                 "wp::det_ctx det_ctx{1, 0, 0, nullptr, nullptr, 0};",
@@ -692,6 +703,40 @@ class DeterministicCodegen:
                     f"wp::det_scatter_buf_t<{target.value_ctype}> {target.helper_name}{{nullptr, nullptr, nullptr, 0}};"
                 )
         return "".join(f"    {line}\n" for line in decls)
+
+    def metal_args_struct_fields(self):
+        """Deterministic parameter fields appended to the Metal wp_args struct."""
+        if self.adj.det_meta is None or not self.adj.det_meta.needs_deterministic:
+            return []
+        fields = [
+            "int _wp_det_phase;",
+            "int _wp_det_debug;",
+            "int* _wp_det_overflow;",
+        ]
+        for target in self.adj.det_meta.counter_targets:
+            names = kernel_raw_counter_param_names(target)
+            fields.append(f"wp::det_counter_buf_t {names['buf']};")
+        for target in self.adj.det_meta.scatter_targets:
+            names = kernel_raw_scatter_param_names(target)
+            fields.append(f"wp::det_scatter_buf_t<{target.value_ctype}> {names['buf']};")
+        return fields
+
+    def metal_args_unpack(self):
+        """Statements unpacking deterministic params from the Metal wp_args struct."""
+        if self.adj.det_meta is None or not self.adj.det_meta.needs_deterministic:
+            return []
+        lines = [
+            "int _wp_det_phase = _wp_args->_wp_det_phase;",
+            "int _wp_det_debug = _wp_args->_wp_det_debug;",
+            "int* _wp_det_overflow = _wp_args->_wp_det_overflow;",
+        ]
+        for target in self.adj.det_meta.counter_targets:
+            names = kernel_raw_counter_param_names(target)
+            lines.append(f"wp::det_counter_buf_t {names['buf']} = _wp_args->{names['buf']};")
+        for target in self.adj.det_meta.scatter_targets:
+            names = kernel_raw_scatter_param_names(target)
+            lines.append(f"wp::det_scatter_buf_t<{target.value_ctype}> {names['buf']} = _wp_args->{names['buf']};")
+        return lines
 
     def needs_store_guard(self) -> bool:
         if self.adj.det_meta is None:

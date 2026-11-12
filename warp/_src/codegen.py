@@ -6893,6 +6893,7 @@ cpu_module_header = """
 #define WP_NO_CRT
 #include "builtin.h"
 #include "deterministic.h"
+#include "deterministic_metal.h"
 
 #define builtin_tid1d() wp::tid(task_index, dim)
 #define builtin_tid2d(x, y) wp::tid(x, y, task_index, dim)
@@ -8203,6 +8204,9 @@ def codegen_kernel(kernel, device, options):
         args_struct = f"struct wp_args_{kernel.get_mangled_name()} {{\n"
         for i in adj.args:
             args_struct += f"    {i.ctype()} {i.label};\n"
+        if device == "metal":
+            for field in adj.deterministic.metal_args_struct_fields():
+                args_struct += f"    {field}\n"
         args_struct += "};\n"
 
     # Build line directive for function definition (subtract 1 to account for 1-indexing of AST line numbers)
@@ -8339,6 +8343,10 @@ def codegen_kernel(kernel, device, options):
 
     forward_func_type = "function" if is_external_constant_params_entry else "kernel"
     forward_body = ""
+    if device == "metal":
+        # Unpack deterministic params from the args struct before kernel_locals declares det_ctx.
+        for stmt in adj.deterministic.metal_args_unpack():
+            forward_body += "    " + stmt + "\n"
     forward_body += adj.deterministic.kernel_locals(device)
     forward_body += codegen_func_forward(
         adj,
