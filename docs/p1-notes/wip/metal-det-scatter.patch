@@ -1,0 +1,282 @@
+diff --git a/warp/_src/codegen.py b/warp/_src/codegen.py
+index 0ead63a2..ae2e9f04 100644
+--- a/warp/_src/codegen.py
++++ b/warp/_src/codegen.py
+@@ -6893,6 +6893,7 @@ cpu_module_header = """
+ #define WP_NO_CRT
+ #include "builtin.h"
+ #include "deterministic.h"
++#include "deterministic_metal.h"
+ 
+ #define builtin_tid1d() wp::tid(task_index, dim)
+ #define builtin_tid2d(x, y) wp::tid(x, y, task_index, dim)
+@@ -8203,6 +8204,9 @@ def codegen_kernel(kernel, device, options):
+         args_struct = f"struct wp_args_{kernel.get_mangled_name()} {{\n"
+         for i in adj.args:
+             args_struct += f"    {i.ctype()} {i.label};\n"
++        if device == "metal":
++            for field in adj.deterministic.metal_args_struct_fields():
++                args_struct += f"    {field}\n"
+         args_struct += "};\n"
+ 
+     # Build line directive for function definition (subtract 1 to account for 1-indexing of AST line numbers)
+@@ -8339,6 +8343,10 @@ def codegen_kernel(kernel, device, options):
+ 
+     forward_func_type = "function" if is_external_constant_params_entry else "kernel"
+     forward_body = ""
++    if device == "metal":
++        # Unpack deterministic params from the args struct before kernel_locals declares det_ctx.
++        for stmt in adj.deterministic.metal_args_unpack():
++            forward_body += "    " + stmt + "\n"
+     forward_body += adj.deterministic.kernel_locals(device)
+     forward_body += codegen_func_forward(
+         adj,
+diff --git a/warp/_src/deterministic.py b/warp/_src/deterministic.py
+index 5f588e9b..0bd70a95 100644
+--- a/warp/_src/deterministic.py
++++ b/warp/_src/deterministic.py
+@@ -679,6 +679,17 @@ class DeterministicCodegen:
+             for target in self.adj.det_meta.scatter_targets:
+                 names = kernel_raw_scatter_param_names(target)
+                 decls.append(f"auto& {target.helper_name} = {names['buf']};")
++        elif device == "metal":
++            # Metal: real scatter buffers (record-then-host-sort-reduce). The deterministic
++            # thread id is task_index (one GPU thread per task, no grid-stride loop). The
++            # consumed-return counter path is CUDA-only; such kernels are refused on Metal,
++            # so counter_targets is empty here.
++            decls = [
++                "wp::det_ctx det_ctx{_wp_det_phase, _wp_det_debug, task_index, _wp_det_overflow, nullptr, 0};",
++            ]
++            for target in self.adj.det_meta.scatter_targets:
++                names = kernel_raw_scatter_param_names(target)
++                decls.append(f"auto& {target.helper_name} = {names['buf']};")
+         else:
+             decls = [
+                 "wp::det_ctx det_ctx{1, 0, 0, nullptr, nullptr, 0};",
+@@ -693,6 +704,40 @@ class DeterministicCodegen:
+                 )
+         return "".join(f"    {line}\n" for line in decls)
+ 
++    def metal_args_struct_fields(self):
++        """Deterministic parameter fields appended to the Metal wp_args struct."""
++        if self.adj.det_meta is None or not self.adj.det_meta.needs_deterministic:
++            return []
++        fields = [
++            "int _wp_det_phase;",
++            "int _wp_det_debug;",
++            "int* _wp_det_overflow;",
++        ]
++        for target in self.adj.det_meta.counter_targets:
++            names = kernel_raw_counter_param_names(target)
++            fields.append(f"wp::det_counter_buf_t {names['buf']};")
++        for target in self.adj.det_meta.scatter_targets:
++            names = kernel_raw_scatter_param_names(target)
++            fields.append(f"wp::det_scatter_buf_t<{target.value_ctype}> {names['buf']};")
++        return fields
++
++    def metal_args_unpack(self):
++        """Statements unpacking deterministic params from the Metal wp_args struct."""
++        if self.adj.det_meta is None or not self.adj.det_meta.needs_deterministic:
++            return []
++        lines = [
++            "int _wp_det_phase = _wp_args->_wp_det_phase;",
++            "int _wp_det_debug = _wp_args->_wp_det_debug;",
++            "int* _wp_det_overflow = _wp_args->_wp_det_overflow;",
++        ]
++        for target in self.adj.det_meta.counter_targets:
++            names = kernel_raw_counter_param_names(target)
++            lines.append(f"wp::det_counter_buf_t {names['buf']} = _wp_args->{names['buf']};")
++        for target in self.adj.det_meta.scatter_targets:
++            names = kernel_raw_scatter_param_names(target)
++            lines.append(f"wp::det_scatter_buf_t<{target.value_ctype}> {names['buf']} = _wp_args->{names['buf']};")
++        return lines
++
+     def needs_store_guard(self) -> bool:
+         if self.adj.det_meta is None:
+             return False
+diff --git a/warp/native/deterministic_metal.h b/warp/native/deterministic_metal.h
+new file mode 100644
+index 00000000..692f52b0
+--- /dev/null
++++ b/warp/native/deterministic_metal.h
+@@ -0,0 +1,179 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++// Deterministic scatter support for the Metal backend.
++//
++// Metal float atomics are non-associative: the order in which threads perform
++// atomic_fetch_add varies run-to-run, so scattered float sums are not reproducible.
++// In deterministic mode (RUN_TO_RUN / GPU_TO_GPU) supported accumulation atomics are
++// redirected here: each thread records a (key, value) pair, where the key packs the
++// destination flat index in the upper 32 bits and the deterministic thread id in the
++// lower 32 bits. After the kernel, the host sorts the records by key (Warp's host radix
++// sort, since Metal arrays live in unified memory) and reduces them in that fixed order.
++//
++// Only the scatter/reduce path (return value unused) is implemented for Metal. The
++// consumed-return counter two-pass path and store guarding remain CUDA-only; kernels
++// that need them are refused on Metal in deterministic mode.
++//
++// This header is included only for Metal (see codegen). It mirrors the layout of the
++// CUDA det_scatter_buf_t / det_ctx in deterministic.h so the shared codegen parameter
++// packing (det_scatter_buf_t ctypes struct) matches.
++
++#if defined(__METAL_VERSION__)
++
++#include <metal_stdlib>
++
++namespace wp {
++
++// Layout must match warp._src.context.det_scatter_buf_t (keys, vals, count, capacity).
++template <typename T> struct det_scatter_buf_t {
++    int64_t* keys;
++    T* vals;
++    int* count;
++    int capacity;
++};
++
++// Layout must match warp._src.context.det_counter_buf_t (unused on Metal: nullptr).
++struct det_counter_buf_t {
++    int64_t* keys;
++    int* values;
++    int* prefixes;
++    int* record_slots;
++    int* cursors;
++    int* count;
++    int capacity;
++    int records_per_thread;
++    array_t<int> target;
++    int target_size;
++};
++
++// Layout must match the CUDA det_ctx (phase, debug, idx, overflow, counter_targets, count).
++struct det_ctx {
++    int phase;
++    int debug;
++    size_t idx;
++    int* overflow;
++    array_t<int>* counter_targets;
++    int counter_target_count;
++};
++
++namespace deterministic {
++
++// Record a (key, value) scatter. The counter slot is allocated with an integer atomic
++// (deterministic count, order-independent); the record order does not matter because the
++// host sorts by (dest_index, thread_id) before reducing.
++template <typename T>
++inline void scatter(det_ctx& ctx, det_scatter_buf_t<T>& buf, int dest_flat_idx, T value)
++{
++    int slot = wp_metal_atomic_add(buf.count, 1);
++    if (slot < buf.capacity) {
++        buf.keys[slot] = (static_cast<int64_t>(dest_flat_idx) << 32)
++            | static_cast<int64_t>(static_cast<unsigned int>(ctx.idx & 0xFFFFFFFFu));
++        buf.vals[slot] = value;
++    } else if (ctx.overflow != nullptr) {
++        int prev = wp_metal_atomic_cas(ctx.overflow, 0, 1);
++        if (ctx.debug && prev == 0) {
++            // Metal shader logging has no printf %s; keep a simple marker.
++            os_log("Warp deterministic scatter overflow");
++        }
++    }
++}
++
++// Metal does not implement the consumed-return counter path; these are never called
++// because such kernels are refused on Metal in deterministic mode. Provide stubs so
++// any referenced symbol compiles.
++inline int counter_add(det_ctx& ctx, det_counter_buf_t& buf, int dest_flat_idx, int value)
++{
++    (void)ctx;
++    (void)buf;
++    (void)dest_flat_idx;
++    (void)value;
++    return 0;
++}
++
++inline bool is_global_store_target(const void* ptr)
++{
++    (void)ptr;
++    return true;
++}
++
++inline bool is_counter_store_target(det_ctx& ctx, const void* ptr)
++{
++    (void)ctx;
++    (void)ptr;
++    return false;
++}
++
++template <template <typename> class A, typename T>
++inline void array_store_if_active(det_ctx& ctx, const A<T>& buf, int i, T value)
++{
++    (void)ctx;
++    wp::array_store(buf, i, value);
++}
++
++template <template <typename> class A, typename T>
++inline void array_store_if_active(det_ctx& ctx, const A<T>& buf, int i, int j, T value)
++{
++    (void)ctx;
++    wp::array_store(buf, i, j, value);
++}
++
++template <template <typename> class A, typename T>
++inline void array_store_if_active(det_ctx& ctx, const A<T>& buf, int i, int j, int k, T value)
++{
++    (void)ctx;
++    wp::array_store(buf, i, j, k, value);
++}
++
++template <template <typename> class A, typename T>
++inline void array_store_if_active(det_ctx& ctx, const A<T>& buf, int i, int j, int k, int l, T value)
++{
++    (void)ctx;
++    wp::array_store(buf, i, j, k, l, value);
++}
++
++}  // namespace deterministic
++}  // namespace wp
++
++// Active deterministic macros for Metal (mirror the __CUDA_ARCH__ block in deterministic.h).
++#define WP_DET_SCATTER_OR_FALLBACK(det_ctx, helper, flat_idx, value, cpu_expr) \
++    do { \
++        if ((det_ctx).phase != 0 && (helper).count != nullptr) { \
++            wp::deterministic::scatter((det_ctx), (helper), static_cast<int>(flat_idx), (value)); \
++        } else { \
++            cpu_expr; \
++        } \
++    } while (0)
++
++#define WP_DET_COUNTER_OR_FALLBACK(out, det_ctx, helper, flat_idx, value, cpu_expr) \
++    do { \
++        (void)(det_ctx); \
++        (void)(helper); \
++        (void)(flat_idx); \
++        (void)(value); \
++        (out) = 0; \
++        cpu_expr; \
++    } while (0)
++
++#define WP_DET_STORE_IF_ACTIVE(det_ctx, ...) \
++    do { \
++        (void)(det_ctx); \
++        wp::array_store(__VA_ARGS__); \
++    } while (0)
++
++#define WP_DET_SLOT_STORE_IF_ACTIVE(det_ctx, slot_lvalue, value_expr) \
++    do { \
++        (void)(det_ctx); \
++        (slot_lvalue) = (value_expr); \
++    } while (0)
++
++#define WP_DET_SIDE_EFFECT_IF_ACTIVE(det_ctx, ...) \
++    do { \
++        if ((det_ctx).phase != 0) { \
++            __VA_ARGS__ \
++        } \
++    } while (0)
++
++#endif  // __METAL_VERSION__
+\ No newline at end of file
