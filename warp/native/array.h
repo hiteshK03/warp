@@ -504,27 +504,20 @@ template <int Size, typename T> struct fixedarray_t {
         strides[3] = sizeof(T);
     }
 
-    CUDA_CALLABLE inline fixedarray_t(const fixedarray_t<Size, T> WP_THREAD& other)
-        : storage()
-        , data(storage)
-        , grad(nullptr)
-        , shape(other.shape)
-        , strides()
-        , ndim(other.ndim)
-        , flags(other.flags)
-    {
-        for (unsigned int i = 0; i < Size; ++i)
-            storage[i] = other.storage[i];
-        for (unsigned int i = 0; i < ARRAY_MAX_DIMS; ++i)
-            strides[i] = other.strides[i];
-    }
+    // Match CPU's compiler-default copy constructor: memberwise copy of the data POINTER
+    // (which aliases the source's storage), grad, shape, strides, and the storage snapshot.
+    // Newton's manifold code passes fixedarrays by value through Any @wp.func params and
+    // mutates them in place; that only works if the copy's data pointer aliases the caller's
+    // storage, exactly as CPU's default copy ctor does. A deep copy (data = local storage)
+    // silently drops those writes and degenerates the box-box contact manifold (1 pt vs 4).
+    CUDA_CALLABLE inline fixedarray_t(const fixedarray_t<Size, T> WP_THREAD& other) = default;
 
     CUDA_CALLABLE fixedarray_t<Size, T> WP_THREAD& operator=(const fixedarray_t<Size, T> WP_THREAD& other)
     {
         for (unsigned int i = 0; i < Size; ++i)
             storage[i] = other.storage[i];
         data = storage;
-        grad = nullptr;
+        grad = other.grad;
         shape = other.shape;
         for (unsigned int i = 0; i < ARRAY_MAX_DIMS; ++i)
             strides[i] = other.strides[i];
